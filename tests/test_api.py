@@ -92,6 +92,65 @@ def test_redact_returns_redacted_text_and_spans():
     }
 
 
+def test_redact_returns_normalized_span_shape():
+    class NormalizedExampleRedactor:
+        def redact(self, text: str) -> RedactionResult:
+            assert text == "My name is Alice Smith and my email is alice@example.com"
+            return RedactionResult(
+                redacted_text=(
+                    "My name is [PRIVATE_PERSON] and my email is [PRIVATE_EMAIL]"
+                ),
+                spans=[
+                    DetectedSpan(
+                        category="private_person",
+                        text="Alice Smith",
+                        start=11,
+                        end=22,
+                        score=0.9999980926513672,
+                    ),
+                    DetectedSpan(
+                        category="private_email",
+                        text="alice@example.com",
+                        start=39,
+                        end=56,
+                        score=0.9999961853027344,
+                    ),
+                ],
+            )
+
+    app.dependency_overrides[get_redactor] = lambda: NormalizedExampleRedactor()
+    client = TestClient(app)
+
+    try:
+        response = client.post(
+            "/redact",
+            json={"text": "My name is Alice Smith and my email is alice@example.com"},
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "redacted_text": "My name is [PRIVATE_PERSON] and my email is [PRIVATE_EMAIL]",
+        "spans": [
+            {
+                "category": "private_person",
+                "text": "Alice Smith",
+                "start": 11,
+                "end": 22,
+                "score": 0.9999980926513672,
+            },
+            {
+                "category": "private_email",
+                "text": "alice@example.com",
+                "start": 39,
+                "end": 56,
+                "score": 0.9999961853027344,
+            },
+        ],
+    }
+
+
 def test_redact_preserves_non_blank_leading_and_trailing_whitespace():
     app.dependency_overrides[get_redactor] = lambda: WhitespacePreservingRedactor()
     client = TestClient(app)
