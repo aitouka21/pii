@@ -85,6 +85,18 @@ Example response:
 | `PII_DEVICE` | unset | Optional Transformers pipeline device |
 | `PII_MODEL_CACHE_DIR` | unset | Cache directory for model artifacts |
 | `TRANSFORMERS_OFFLINE` | `0` | Set to `1` for offline-only model loading |
+| `PII_ENABLE_CHUNKING` | `1` | Set to `0` to bypass token-window chunking and use whole-text inference |
+| `PII_CHUNK_MAX_TOKENS` | `256` | Maximum model-token window size for long `/redact` inputs |
+| `PII_CHUNK_OVERLAP_TOKENS` | `32` | Number of tokens repeated between adjacent windows to reduce boundary misses |
+| `PII_CHUNK_BATCH_SIZE` | `4` | Number of token windows classified per Transformers pipeline batch |
+
+## Performance and concurrency
+
+Long `/redact` requests are split into overlapping token windows before model inference when `PII_ENABLE_CHUNKING=1`. The service batches those windows through the same Transformers pipeline, rebases chunk-local offsets to original-text offsets, then performs BIOES decoding and masking globally. Set `PII_ENABLE_CHUNKING=0` to bypass chunking and force whole-text inference for maximum-context mode, A/B benchmarking, or operational rollback.
+
+The default guardrail settings are `PII_CHUNK_MAX_TOKENS=256`, `PII_CHUNK_OVERLAP_TOKENS=32`, and `PII_CHUNK_BATCH_SIZE=4`. During default selection, a local repeated PII benchmark of 7,520 characters / 1,681 tokens reduced model latency from 19.752s to 6.967s while preserving identical redacted text and identical span category/text/start/end output. A later smoke run on this implementation measured 14.774s to 6.160s on a 6,840-character payload with the same output parity. Hardware and input shape affect results, so tune these values against representative traffic.
+
+The default `run.sh` starts one Uvicorn worker. FastAPI can accept concurrent synchronous requests through its threadpool, but all requests share the same in-process model and CPU resources. Multiple workers may improve throughput if the machine has enough memory for one model instance per worker, but workers do not reduce latency for one long request.
 
 ## Tests
 

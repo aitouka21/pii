@@ -1,5 +1,27 @@
 from pii_service.config import Settings
-from pii_service.redactor import DetectedSpan, PrivacyFilterRedactor, redact_text_with_spans
+from pii_service.redactor import (
+    DetectedSpan,
+    PrivacyFilterRedactor,
+    RedactionResult,
+    TextChunk,
+    plan_token_chunks,
+    rebase_span,
+    redact_text_with_spans,
+)
+
+
+class FakeTokenizer:
+    def __call__(self, text, *, return_offsets_mapping, add_special_tokens):
+        assert return_offsets_mapping is True
+        assert add_special_tokens is False
+        offsets = []
+        index = 0
+        for token in text.split(" "):
+            start = index
+            end = index + len(token)
+            offsets.append((start, end))
+            index = end + 1
+        return {"offset_mapping": offsets}
 
 
 def test_redact_text_with_spans_replaces_offsets_from_end_to_start():
@@ -22,6 +44,33 @@ def test_redact_text_with_spans_ignores_spans_without_offsets():
     result = redact_text_with_spans(text, spans)
 
     assert result == "Call Alice"
+
+
+def test_plan_token_chunks_returns_single_chunk_when_text_fits():
+    chunks = plan_token_chunks("one two three", FakeTokenizer(), 10, 2)
+
+    assert chunks == [TextChunk(start_char=0, end_char=13, text="one two three")]
+
+
+def test_plan_token_chunks_uses_overlapping_token_windows():
+    chunks = plan_token_chunks("one two three four five", FakeTokenizer(), 3, 1)
+
+    assert chunks == [
+        TextChunk(start_char=0, end_char=13, text="one two three"),
+        TextChunk(start_char=8, end_char=23, text="three four five"),
+    ]
+
+
+def test_rebase_span_moves_chunk_offsets_to_original_text_offsets():
+    span = DetectedSpan("S-private_email", "alice@example.com", 3, 20, 0.99)
+
+    assert rebase_span(span, 50) == DetectedSpan(
+        "S-private_email",
+        "alice@example.com",
+        53,
+        70,
+        0.99,
+    )
 
 
 def test_redact_text_with_spans_validates_against_original_text():
@@ -330,4 +379,242 @@ def test_redactor_uses_injected_classifier():
             end=23,
             score=0.99,
         )
+    ]
+
+
+def test_redactor_uses_single_model_call_for_short_text():
+    calls = []
+
+    def fake_classifier(text, aggregation_strategy):
+        calls.append(text)
+        assert aggregation_strategy == "none"
+        return []
+
+    settings = Settings(chunk_max_tokens=256, chunk_overlap_tokens=32, chunk_batch_size=4)
+    redactor = PrivacyFilterRedactor(settings=settings, classifier=fake_classifier)
+    redactor._tokenizer = FakeTokenizer()
+
+    result = redactor.redact("one two")
+
+    assert calls == ["one two"]
+    assert result == RedactionResult(redacted_text="one two", spans=[])
+
+
+def test_redactor_bypasses_chunking_when_disabled():
+    calls = []
+
+    def fake_classifier(text, aggregation_strategy):
+        calls.append(text)
+        assert aggregation_strategy == "none"
+        return []
+
+    settings = Settings(
+        enable_chunking=False,
+        chunk_max_tokens=4,
+        chunk_overlap_tokens=1,
+        chunk_batch_size=4,
+    )
+    redactor = PrivacyFilterRedactor(settings=settings, classifier=fake_classifier)
+    redactor._tokenizer = FakeTokenizer()
+
+    result = redactor.redact("zero one two three four five")
+
+    assert calls == ["zero one two three four five"]
+    assert result == RedactionResult(
+        redacted_text="zero one two three four five",
+        spans=[],
+    )
+
+
+def test_redactor_falls_back_to_full_text_when_tokenizer_cannot_plan_chunks():
+    class BrokenTokenizer:
+        def __call__(self, text, *, return_offsets_mapping, add_special_tokens):
+            raise NotImplementedError("offset mapping unsupported")
+
+    calls = []
+
+    def fake_classifier(text, aggregation_strategy):
+        calls.append(text)
+        assert aggregation_strategy == "none"
+        return []
+
+    settings = Settings(chunk_max_tokens=4, chunk_overlap_tokens=1, chunk_batch_size=4)
+    redactor = PrivacyFilterRedactor(settings=settings, classifier=fake_classifier)
+    redactor._tokenizer = BrokenTokenizer()
+
+    result = redactor.redact("zero one two three four five")
+
+    assert calls == ["zero one two three four five"]
+    assert result == RedactionResult(
+        redacted_text="zero one two three four five",
+        spans=[],
+    )
+
+
+def test_redactor_falls_back_to_full_text_when_tokenizer_lacks_offsets():
+    class MissingOffsetsTokenizer:
+        def __call__(self, text, *, return_offsets_mapping, add_special_tokens):
+            return {}
+
+    calls = []
+
+    def fake_classifier(text, aggregation_strategy):
+        calls.append(text)
+        assert aggregation_strategy == "none"
+        return []
+
+    settings = Settings(chunk_max_tokens=4, chunk_overlap_tokens=1, chunk_batch_size=4)
+    redactor = PrivacyFilterRedactor(settings=settings, classifier=fake_classifier)
+    redactor._tokenizer = MissingOffsetsTokenizer()
+
+    result = redactor.redact("zero one two three four five")
+
+    assert calls == ["zero one two three four five"]
+    assert result == RedactionResult(
+        redacted_text="zero one two three four five",
+        spans=[],
+    )
+
+
+def test_redactor_uses_tokenizer_from_injected_classifier():
+    calls = []
+
+    class FakePipeline:
+        tokenizer = FakeTokenizer()
+
+        def __call__(self, text, aggregation_strategy, batch_size=None):
+            calls.append((text, batch_size))
+            assert aggregation_strategy == "none"
+            return [[] for _ in text]
+
+    settings = Settings(chunk_max_tokens=4, chunk_overlap_tokens=1, chunk_batch_size=4)
+    redactor = PrivacyFilterRedactor(settings=settings, classifier=FakePipeline())
+
+    result = redactor.redact("zero one two three four five")
+
+    assert calls == [
+        (["zero one two three", "three four five"], 4),
+    ]
+    assert result == RedactionResult(
+        redacted_text="zero one two three four five",
+        spans=[],
+    )
+
+
+def test_redactor_batches_long_text_and_rebases_offsets():
+    calls = []
+
+    def fake_classifier(text, aggregation_strategy, batch_size=None):
+        calls.append((text, batch_size))
+        assert aggregation_strategy == "none"
+        assert batch_size == 4
+        results = []
+        for chunk_text in text:
+            if "alice@example.com" in chunk_text:
+                start = chunk_text.index("alice@example.com")
+                results.append(
+                    [
+                        {
+                            "entity": "S-private_email",
+                            "word": "alice@example.com",
+                            "start": start,
+                            "end": start + len("alice@example.com"),
+                            "score": 0.99,
+                        }
+                    ]
+                )
+            else:
+                results.append([])
+        return results
+
+    text = "zero one two alice@example.com three four five six"
+    settings = Settings(chunk_max_tokens=4, chunk_overlap_tokens=1, chunk_batch_size=4)
+    redactor = PrivacyFilterRedactor(settings=settings, classifier=fake_classifier)
+    redactor._tokenizer = FakeTokenizer()
+
+    result = redactor.redact(text)
+
+    assert len(calls) == 1
+    assert result.redacted_text == "zero one two [PRIVATE_EMAIL] three four five six"
+    assert result.spans == [
+        DetectedSpan("private_email", "alice@example.com", 13, 30, 0.99)
+    ]
+
+
+def test_redactor_deduplicates_entities_detected_in_overlapping_chunks():
+    def fake_classifier(text, aggregation_strategy, batch_size=None):
+        assert aggregation_strategy == "none"
+        assert batch_size == 4
+        results = []
+        for chunk_text in text:
+            if "alice@example.com" not in chunk_text:
+                results.append([])
+                continue
+            start = chunk_text.index("alice@example.com")
+            results.append(
+                [
+                    {
+                        "entity": "S-private_email",
+                        "word": "alice@example.com",
+                        "start": start,
+                        "end": start + len("alice@example.com"),
+                        "score": 0.99,
+                    }
+                ]
+            )
+        return results
+
+    text = "zero one two alice@example.com three four"
+    settings = Settings(chunk_max_tokens=5, chunk_overlap_tokens=3, chunk_batch_size=4)
+    redactor = PrivacyFilterRedactor(settings=settings, classifier=fake_classifier)
+    redactor._tokenizer = FakeTokenizer()
+
+    result = redactor.redact(text)
+
+    assert result.redacted_text == "zero one two [PRIVATE_EMAIL] three four"
+    assert result.spans == [
+        DetectedSpan("private_email", "alice@example.com", 13, 30, 0.99)
+    ]
+
+
+def test_redactor_deduplicates_overlapping_multi_token_entities():
+    def fake_classifier(text, aggregation_strategy, batch_size=None):
+        assert aggregation_strategy == "none"
+        assert batch_size == 4
+        results = []
+        for chunk_text in text:
+            if "Alice Smith" not in chunk_text:
+                results.append([])
+                continue
+            start = chunk_text.index("Alice")
+            results.append(
+                [
+                    {
+                        "entity": "B-private_person",
+                        "word": "Alice",
+                        "start": start,
+                        "end": start + len("Alice"),
+                        "score": 0.98,
+                    },
+                    {
+                        "entity": "E-private_person",
+                        "word": "Smith",
+                        "start": start + len("Alice "),
+                        "end": start + len("Alice Smith"),
+                        "score": 0.99,
+                    },
+                ]
+            )
+        return results
+
+    text = "zero one Alice Smith two three"
+    settings = Settings(chunk_max_tokens=5, chunk_overlap_tokens=3, chunk_batch_size=4)
+    redactor = PrivacyFilterRedactor(settings=settings, classifier=fake_classifier)
+    redactor._tokenizer = FakeTokenizer()
+
+    result = redactor.redact(text)
+
+    assert result.redacted_text == "zero one [PRIVATE_PERSON] two three"
+    assert result.spans == [
+        DetectedSpan("private_person", "Alice Smith", 9, 20, 0.99)
     ]

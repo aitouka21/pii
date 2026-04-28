@@ -8,8 +8,12 @@ from pii_service.config import Settings
 
 class Classifier(Protocol):
     def __call__(
-        self, text: str, *, aggregation_strategy: str
-    ) -> list[dict[str, Any]]: ...
+        self,
+        text: str | list[str],
+        *,
+        aggregation_strategy: str,
+        batch_size: int | None = None,
+    ) -> list[dict[str, Any]] | list[list[dict[str, Any]]]: ...
 
 
 @dataclass(frozen=True)
@@ -27,6 +31,13 @@ class RedactionResult:
     spans: list[DetectedSpan]
 
 
+@dataclass(frozen=True)
+class TextChunk:
+    start_char: int
+    end_char: int
+    text: str
+
+
 def marker_for_category(category: str) -> str:
     return f"[{category.upper()}]"
 
@@ -40,6 +51,63 @@ def _valid_spans(text: str, spans: list[DetectedSpan]) -> list[DetectedSpan]:
         and span.end is not None
         and 0 <= span.start < span.end <= text_length
     ]
+
+
+def plan_token_chunks(
+    text: str,
+    tokenizer: Any,
+    max_tokens: int,
+    overlap_tokens: int,
+) -> list[TextChunk]:
+    if max_tokens < 1:
+        raise ValueError("max_tokens must be at least 1")
+    if overlap_tokens < 0:
+        raise ValueError("overlap_tokens must be at least 0")
+    if overlap_tokens >= max_tokens:
+        raise ValueError("overlap_tokens must be less than max_tokens")
+
+    encoded = tokenizer(
+        text,
+        return_offsets_mapping=True,
+        add_special_tokens=False,
+    )
+    offsets = [
+        (start, end)
+        for start, end in encoded["offset_mapping"]
+        if isinstance(start, int) and isinstance(end, int) and end > start
+    ]
+    if len(offsets) <= max_tokens:
+        return [TextChunk(start_char=0, end_char=len(text), text=text)]
+
+    chunks: list[TextChunk] = []
+    step = max_tokens - overlap_tokens
+    start_token = 0
+    while start_token < len(offsets):
+        end_token = min(start_token + max_tokens, len(offsets))
+        start_char = offsets[start_token][0]
+        end_char = offsets[end_token - 1][1]
+        chunks.append(
+            TextChunk(
+                start_char=start_char,
+                end_char=end_char,
+                text=text[start_char:end_char],
+            )
+        )
+        if end_token >= len(offsets):
+            break
+        start_token += step
+
+    return chunks
+
+
+def rebase_span(span: DetectedSpan, offset: int) -> DetectedSpan:
+    return DetectedSpan(
+        category=span.category,
+        text=span.text,
+        start=span.start + offset if span.start is not None else None,
+        end=span.end + offset if span.end is not None else None,
+        score=span.score,
+    )
 
 
 def _spans_overlap(left: DetectedSpan, right: DetectedSpan) -> bool:
@@ -191,6 +259,7 @@ class PrivacyFilterRedactor:
     ) -> None:
         self._settings = settings or Settings()
         self._classifier = classifier
+        self._tokenizer: Any | None = getattr(classifier, "tokenizer", None)
 
     def load(self) -> None:
         if self._classifier is not None:
@@ -209,15 +278,49 @@ class PrivacyFilterRedactor:
             pipeline_kwargs["model_kwargs"] = model_kwargs
 
         self._classifier = pipeline(**pipeline_kwargs)
+        self._tokenizer = getattr(self._classifier, "tokenizer", None)
+
+    def _classify(self, text: str) -> list[DetectedSpan]:
+        if self._classifier is None:
+            raise RuntimeError("Privacy filter classifier is not loaded")
+
+        def classify_full_text() -> list[DetectedSpan]:
+            raw_spans = self._classifier(text, aggregation_strategy="none")
+            return [self._to_span(raw_span) for raw_span in raw_spans]
+
+        if not self._settings.enable_chunking or self._tokenizer is None:
+            return classify_full_text()
+
+        try:
+            chunks = plan_token_chunks(
+                text,
+                self._tokenizer,
+                self._settings.chunk_max_tokens,
+                self._settings.chunk_overlap_tokens,
+            )
+        except (KeyError, TypeError, ValueError, NotImplementedError):
+            return classify_full_text()
+        if len(chunks) == 1:
+            return classify_full_text()
+
+        raw_results = self._classifier(
+            [chunk.text for chunk in chunks],
+            aggregation_strategy="none",
+            batch_size=self._settings.chunk_batch_size,
+        )
+        token_spans: list[DetectedSpan] = []
+        for chunk, chunk_raw_spans in zip(chunks, raw_results, strict=True):
+            token_spans.extend(
+                rebase_span(self._to_span(raw_span), chunk.start_char)
+                for raw_span in chunk_raw_spans
+            )
+        return token_spans
 
     def redact(self, text: str) -> RedactionResult:
         if self._classifier is None:
             self.load()
-        if self._classifier is None:
-            raise RuntimeError("Privacy filter classifier is not loaded")
 
-        raw_spans = self._classifier(text, aggregation_strategy="none")
-        token_spans = [self._to_span(raw_span) for raw_span in raw_spans]
+        token_spans = self._classify(text)
         spans = decode_token_spans(text, token_spans)
         return RedactionResult(
             redacted_text=redact_text_with_spans(text, spans),
