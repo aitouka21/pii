@@ -22,6 +22,27 @@ class FakeRedactor:
         )
 
 
+class AnalyzeOnlyRedactor:
+    def detect(self, text: str) -> list[DetectedSpan]:
+        assert text == "Alice emailed alice@example.com"
+        return [
+            DetectedSpan(
+                category="private_person",
+                text="Alice",
+                start=0,
+                end=5,
+                score=0.99,
+            ),
+            DetectedSpan(
+                category="private_email",
+                text="alice@example.com",
+                start=14,
+                end=31,
+                score=0.98,
+            ),
+        ]
+
+
 class PassthroughRedactor:
     def redact(self, text: str) -> RedactionResult:
         return RedactionResult(redacted_text=text, spans=[])
@@ -211,3 +232,107 @@ def test_redact_runtime_error_returns_503_with_message():
 
     assert response.status_code == 503
     assert response.json() == {"detail": "Classifier not loaded"}
+
+
+def test_analyze_returns_presidio_style_results():
+    app.dependency_overrides[get_redactor] = lambda: AnalyzeOnlyRedactor()
+    client = TestClient(app)
+
+    try:
+        response = client.post("/analyze", json={"text": "Alice emailed alice@example.com"})
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    assert response.json() == [
+        {
+            "entity_type": "PERSON",
+            "start": 0,
+            "end": 5,
+            "score": 0.99,
+            "recognition_metadata": {"recognizer_name": "private_person"},
+        },
+        {
+            "entity_type": "EMAIL_ADDRESS",
+            "start": 14,
+            "end": 31,
+            "score": 0.98,
+            "recognition_metadata": {"recognizer_name": "private_email"},
+        },
+    ]
+
+
+def test_analyze_filters_requested_entities():
+    app.dependency_overrides[get_redactor] = lambda: AnalyzeOnlyRedactor()
+    client = TestClient(app)
+
+    try:
+        response = client.post(
+            "/analyze",
+            json={
+                "text": "Alice emailed alice@example.com",
+                "entities": ["EMAIL_ADDRESS"],
+            },
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    assert response.json() == [
+        {
+            "entity_type": "EMAIL_ADDRESS",
+            "start": 14,
+            "end": 31,
+            "score": 0.98,
+            "recognition_metadata": {"recognizer_name": "private_email"},
+        }
+    ]
+
+
+def test_analyze_rejects_whitespace_only_text():
+    client = TestClient(app)
+
+    response = client.post("/analyze", json={"text": " \n\t "})
+
+    assert response.status_code == 422
+
+
+def test_anonymize_returns_presidio_style_text_and_items():
+    client = TestClient(app)
+
+    response = client.post(
+        "/anonymize",
+        json={
+            "text": "Alice emailed alice@example.com",
+            "analyzer_results": [
+                {"entity_type": "PERSON", "start": 0, "end": 5, "score": 0.99},
+                {
+                    "entity_type": "EMAIL_ADDRESS",
+                    "start": 14,
+                    "end": 31,
+                    "score": 0.98,
+                },
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "text": "<PERSON> emailed <EMAIL_ADDRESS>",
+        "items": [
+            {
+                "start": 0,
+                "end": 8,
+                "entity_type": "PERSON",
+                "text": "<PERSON>",
+                "operator": "replace",
+            },
+            {
+                "start": 17,
+                "end": 32,
+                "entity_type": "EMAIL_ADDRESS",
+                "text": "<EMAIL_ADDRESS>",
+                "operator": "replace",
+            },
+        ],
+    }

@@ -1,3 +1,4 @@
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Protocol
 
@@ -38,8 +39,33 @@ class TextChunk:
     text: str
 
 
+PRESIDIO_ENTITY_BY_CATEGORY = {
+    "private_address": "LOCATION",
+    "private_credit_card": "CREDIT_CARD",
+    "private_date": "DATE_TIME",
+    "private_email": "EMAIL_ADDRESS",
+    "private_iban": "IBAN_CODE",
+    "private_ip": "IP_ADDRESS",
+    "private_person": "PERSON",
+    "private_phone": "PHONE_NUMBER",
+    "private_ssn": "US_SSN",
+}
+
+
 def marker_for_category(category: str) -> str:
     return f"[{category.upper()}]"
+
+
+def presidio_entity_for_category(category: str) -> str:
+    if category in PRESIDIO_ENTITY_BY_CATEGORY:
+        return PRESIDIO_ENTITY_BY_CATEGORY[category]
+    if category.startswith("private_"):
+        return category.removeprefix("private_").upper()
+    return category.upper()
+
+
+def presidio_marker_for_entity(entity_type: str) -> str:
+    return f"<{entity_type.upper()}>"
 
 
 def _valid_spans(text: str, spans: list[DetectedSpan]) -> list[DetectedSpan]:
@@ -244,13 +270,108 @@ def decode_token_spans(text: str, spans: list[DetectedSpan]) -> list[DetectedSpa
 
 
 def redact_text_with_spans(text: str, spans: list[DetectedSpan]) -> str:
-    redacted = text
-    selected_spans = _select_non_overlapping_spans(text, spans)
-    for span in sorted(selected_spans, key=lambda item: item.start or 0, reverse=True):
+    return replace_text_with_spans(
+        text,
+        spans,
+        lambda span: marker_for_category(span.category),
+    )
+
+
+def replace_text_with_spans(
+    text: str,
+    spans: list[DetectedSpan],
+    replacement_for_span: Callable[[DetectedSpan], str],
+) -> str:
+    replaced = text
+    for span in sorted(
+        _select_non_overlapping_spans(text, spans),
+        key=lambda item: item.start or 0,
+        reverse=True,
+    ):
         start = span.start or 0
         end = span.end or 0
-        redacted = redacted[:start] + marker_for_category(span.category) + redacted[end:]
-    return redacted
+        replaced = replaced[:start] + replacement_for_span(span) + replaced[end:]
+    return replaced
+
+
+def presidio_analyze_results(
+    text: str,
+    spans: list[DetectedSpan],
+    entities: list[str] | None = None,
+) -> list[dict[str, Any]]:
+    entity_allowlist = set(entities or [])
+    results: list[dict[str, Any]] = []
+    selected_spans = sorted(
+        _select_non_overlapping_spans(text, spans),
+        key=lambda item: item.start or 0,
+    )
+    for span in selected_spans:
+        entity_type = presidio_entity_for_category(span.category)
+        if entity_allowlist and entity_type not in entity_allowlist:
+            continue
+        if span.start is None or span.end is None:
+            continue
+        results.append(
+            {
+                "entity_type": entity_type,
+                "start": span.start,
+                "end": span.end,
+                "score": span.score,
+                "recognition_metadata": {"recognizer_name": span.category},
+            }
+        )
+    return results
+
+
+def anonymize_text_with_presidio_results(
+    text: str,
+    analyzer_results: list[dict[str, Any]],
+) -> dict[str, Any]:
+    spans = [
+        DetectedSpan(
+            category=str(item.get("entity_type") or "UNKNOWN"),
+            text=text[item["start"] : item["end"]]
+            if isinstance(item.get("start"), int) and isinstance(item.get("end"), int)
+            else "",
+            start=item.get("start") if isinstance(item.get("start"), int) else None,
+            end=item.get("end") if isinstance(item.get("end"), int) else None,
+            score=float(item.get("score") or 0.0),
+        )
+        for item in analyzer_results
+    ]
+    selected_spans = sorted(
+        _select_non_overlapping_spans(text, spans),
+        key=lambda item: item.start or 0,
+    )
+
+    parts: list[str] = []
+    items: list[dict[str, Any]] = []
+    cursor = 0
+    output_position = 0
+
+    for span in selected_spans:
+        start = span.start or 0
+        end = span.end or 0
+        prefix = text[cursor:start]
+        parts.append(prefix)
+        output_position += len(prefix)
+
+        replacement = presidio_marker_for_entity(span.category)
+        parts.append(replacement)
+        items.append(
+            {
+                "start": output_position,
+                "end": output_position + len(replacement),
+                "entity_type": span.category,
+                "text": replacement,
+                "operator": "replace",
+            }
+        )
+        output_position += len(replacement)
+        cursor = end
+
+    parts.append(text[cursor:])
+    return {"text": "".join(parts), "items": items}
 
 
 class PrivacyFilterRedactor:
@@ -316,12 +437,15 @@ class PrivacyFilterRedactor:
             )
         return token_spans
 
-    def redact(self, text: str) -> RedactionResult:
+    def detect(self, text: str) -> list[DetectedSpan]:
         if self._classifier is None:
             self.load()
 
         token_spans = self._classify(text)
-        spans = decode_token_spans(text, token_spans)
+        return decode_token_spans(text, token_spans)
+
+    def redact(self, text: str) -> RedactionResult:
+        spans = self.detect(text)
         return RedactionResult(
             redacted_text=redact_text_with_spans(text, spans),
             spans=spans,

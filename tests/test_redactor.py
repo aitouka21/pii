@@ -4,7 +4,10 @@ from pii_service.redactor import (
     PrivacyFilterRedactor,
     RedactionResult,
     TextChunk,
+    anonymize_text_with_presidio_results,
     plan_token_chunks,
+    presidio_analyze_results,
+    presidio_entity_for_category,
     rebase_span,
     redact_text_with_spans,
 )
@@ -208,6 +211,64 @@ def test_redact_text_with_spans_prefers_highest_score_for_equal_length_overlap()
     result = redact_text_with_spans(text, spans)
 
     assert result == "[HIGH_CONFIDENCE] code"
+
+
+def test_presidio_entity_for_category_maps_known_categories():
+    assert presidio_entity_for_category("private_person") == "PERSON"
+    assert presidio_entity_for_category("private_email") == "EMAIL_ADDRESS"
+
+
+def test_presidio_entity_for_category_uses_uppercase_fallback():
+    assert presidio_entity_for_category("private_account_number") == "ACCOUNT_NUMBER"
+    assert presidio_entity_for_category("custom_secret") == "CUSTOM_SECRET"
+
+
+def test_presidio_analyze_results_translates_and_filters_entities():
+    text = "Alice emailed alice@example.com"
+    spans = [
+        DetectedSpan("private_person", "Alice", 0, 5, 0.99),
+        DetectedSpan("private_email", "alice@example.com", 14, 31, 0.98),
+    ]
+
+    assert presidio_analyze_results(text, spans, entities=["EMAIL_ADDRESS"]) == [
+        {
+            "entity_type": "EMAIL_ADDRESS",
+            "start": 14,
+            "end": 31,
+            "score": 0.98,
+            "recognition_metadata": {"recognizer_name": "private_email"},
+        }
+    ]
+
+
+def test_anonymize_text_with_presidio_results_returns_text_and_items():
+    result = anonymize_text_with_presidio_results(
+        "Alice emailed alice@example.com",
+        [
+            {"entity_type": "PERSON", "start": 0, "end": 5, "score": 0.99},
+            {"entity_type": "EMAIL_ADDRESS", "start": 14, "end": 31, "score": 0.98},
+        ],
+    )
+
+    assert result == {
+        "text": "<PERSON> emailed <EMAIL_ADDRESS>",
+        "items": [
+            {
+                "start": 0,
+                "end": 8,
+                "entity_type": "PERSON",
+                "text": "<PERSON>",
+                "operator": "replace",
+            },
+            {
+                "start": 17,
+                "end": 32,
+                "entity_type": "EMAIL_ADDRESS",
+                "text": "<EMAIL_ADDRESS>",
+                "operator": "replace",
+            },
+        ],
+    }
 
 
 def test_redactor_decodes_bioes_chunks_from_raw_model_tokens():

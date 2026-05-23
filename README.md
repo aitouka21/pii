@@ -4,7 +4,12 @@ Minimal offline FastAPI service for PII redaction using the Hugging Face `openai
 
 ## Scope
 
-This is a POC for local testing. It includes one redaction endpoint and does not include auth, persistence, queues, UI, production deployment, or compliance guarantees.
+This is a POC for local testing. It includes:
+
+- a simple `/redact` endpoint for direct service use
+- LiteLLM-compatible Presidio-style `/analyze` and `/anonymize` endpoints for guardrail integration
+
+It does not include auth, persistence, queues, UI, production deployment, or compliance guarantees.
 
 ## Setup
 
@@ -76,6 +81,40 @@ Example response:
   ]
 }
 ```
+
+Analyze text with LiteLLM Presidio-compatible output:
+
+```bash
+curl -X POST http://127.0.0.1:8000/analyze \
+  -H 'Content-Type: application/json' \
+  -d '{"text":"My name is Alice Smith and my email is alice@example.com","language":"en"}'
+```
+
+Anonymize text from analyzer results:
+
+```bash
+curl -X POST http://127.0.0.1:8000/anonymize \
+  -H 'Content-Type: application/json' \
+  -d '{"text":"My name is Alice Smith and my email is alice@example.com","analyzer_results":[{"entity_type":"PERSON","start":11,"end":22,"score":0.99},{"entity_type":"EMAIL_ADDRESS","start":39,"end":56,"score":0.99}]}'
+```
+
+## LiteLLM guardrail configuration
+
+Use LiteLLM's built-in Presidio guardrail integration and point both Presidio API bases at this service:
+
+```yaml
+guardrails:
+  - guardrail_name: "pii-presidio"
+    litellm_params:
+      guardrail: presidio
+      mode: "pre_call"
+      output_parse_pii: true
+      presidio_language: "en"
+      presidio_analyzer_api_base: "http://127.0.0.1:8000/"
+      presidio_anonymizer_api_base: "http://127.0.0.1:8000/"
+```
+
+This path is the best fit for LiteLLM output parsing because LiteLLM already handles numbered placeholder token storage and post-call unmasking for its Presidio integration.
 
 ## Configuration
 

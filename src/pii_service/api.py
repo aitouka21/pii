@@ -1,14 +1,19 @@
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from typing import Annotated
+from typing import Annotated, Any
 
 from fastapi import Depends, FastAPI, HTTPException
 from pydantic import BaseModel, Field, field_validator
 
-from pii_service.redactor import DetectedSpan, PrivacyFilterRedactor
+from pii_service.redactor import (
+    DetectedSpan,
+    PrivacyFilterRedactor,
+    anonymize_text_with_presidio_results,
+    presidio_analyze_results,
+)
 
 
-class RedactRequest(BaseModel):
+class TextRequest(BaseModel):
     text: str = Field(min_length=1)
 
     @field_validator("text")
@@ -17,6 +22,16 @@ class RedactRequest(BaseModel):
         if not value.strip():
             raise ValueError("text must not be blank")
         return value
+
+
+class RedactRequest(TextRequest):
+    pass
+
+
+class AnalyzeRequest(TextRequest):
+    language: str | None = None
+    ad_hoc_recognizers: list[Any] | None = None
+    entities: list[str] | None = None
 
 
 class SpanResponse(BaseModel):
@@ -30,6 +45,31 @@ class SpanResponse(BaseModel):
 class RedactResponse(BaseModel):
     redacted_text: str
     spans: list[SpanResponse]
+
+
+class AnalyzeResultItem(BaseModel):
+    entity_type: str
+    start: int
+    end: int
+    score: float
+    recognition_metadata: dict[str, Any] | None = None
+
+
+class AnonymizeRequest(TextRequest):
+    analyzer_results: list[AnalyzeResultItem]
+
+
+class AnonymizeItemResponse(BaseModel):
+    start: int
+    end: int
+    entity_type: str
+    text: str
+    operator: str
+
+
+class AnonymizeResponse(BaseModel):
+    text: str
+    items: list[AnonymizeItemResponse]
 
 
 redactor = PrivacyFilterRedactor()
@@ -67,6 +107,40 @@ def create_app(load_model_on_startup: bool = True) -> FastAPI:
         return RedactResponse(
             redacted_text=result.redacted_text,
             spans=[_span_response(span) for span in result.spans],
+        )
+
+    @app.post("/analyze", response_model=list[AnalyzeResultItem])
+    def analyze(
+        request: AnalyzeRequest,
+        service: Annotated[PrivacyFilterRedactor, Depends(get_redactor)],
+    ) -> list[AnalyzeResultItem]:
+        try:
+            spans = service.detect(request.text)
+            results = presidio_analyze_results(
+                request.text,
+                spans,
+                entities=request.entities,
+            )
+        except RuntimeError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail="Analysis failed") from exc
+
+        return [AnalyzeResultItem(**item) for item in results]
+
+    @app.post("/anonymize", response_model=AnonymizeResponse)
+    def anonymize(request: AnonymizeRequest) -> AnonymizeResponse:
+        try:
+            result = anonymize_text_with_presidio_results(
+                request.text,
+                [item.model_dump() for item in request.analyzer_results],
+            )
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail="Anonymization failed") from exc
+
+        return AnonymizeResponse(
+            text=result["text"],
+            items=[AnonymizeItemResponse(**item) for item in result["items"]],
         )
 
     return app
